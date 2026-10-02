@@ -1,0 +1,30 @@
+﻿# --- Build output ---
+Debug/
+Release/
+build/
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+
+# --- STM32CubeIDE / Eclipse project junk ---
+.metadata/
+.settings/
+*.launch
+
+# --- Wokwi ---
+.wokwi/
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# --- Logs / captures ---
+*.log

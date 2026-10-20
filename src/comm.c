@@ -14,9 +14,12 @@
  * which is small as long as main() doesn't block elsewhere — confirm
  * this against Gunadeep's measured latency in the latency budget.
  *
- * Retarget for your actual board/pins by changing RELAY_HUART below
- * (and the corresponding init in main.c / config.h) once Gunadeep
- * confirms the Pin Map.
+ * Each node uses two relay UARTs plus a third UART for logging (Roshan):
+ *   RELAY_RX_HUART  receives from the PREVIOUS node  (relay-in)
+ *   RELAY_TX_HUART  transmits to the NEXT node         (relay-out)
+ * In Renode, Gunadeep connects RELAY_TX of node k to RELAY_RX of node k+1
+ * through one UART hub per link. Which USART peripherals these are is
+ * fixed in the UART and pin map (pins.h).
  */
 #include "comm.h"
 #include "stm32f4xx_hal.h"   /* swap for the matching HAL header if the board changes */
@@ -25,7 +28,8 @@
 /* ------------------------------------------------------------------ */
 /* Board wiring — the ONE place this file depends on a specific UART  */
 /* ------------------------------------------------------------------ */
-extern UART_HandleTypeDef RELAY_HUART;   /* defined/initialised in main.c */
+extern UART_HandleTypeDef RELAY_RX_HUART;   /* relay-in,  defined/initialised in main.c */
+extern UART_HandleTypeDef RELAY_TX_HUART;   /* relay-out, defined/initialised in main.c */
 
 /* ------------------------------------------------------------------ */
 /* Internal state                                                     */
@@ -39,7 +43,13 @@ static volatile RxState   s_rxState;
 static volatile uint8_t   s_rxBuf[COMM_PKT_LEN];
 static volatile uint8_t   s_rxCount;
 static volatile uint32_t  s_rxLastByteTick;   /* HAL_GetTick() at last byte received */
-static volatile uint8_t   s_rxPacketReady;    /* set by ISR, cleared by Comm_Poll    */
+/* Validated packets wait here (src, seq, sev, hops) until Comm_Poll() hands
+ * them to node_app. A queue, not a single flag, so two packets arriving
+ * back to back cannot overwrite each other before the main loop runs. */
+#define COMM_RX_QUEUE_LEN 4u
+static volatile uint8_t   s_rxQ[COMM_RX_QUEUE_LEN][4];
+static volatile uint8_t   s_rxQHead, s_rxQTail, s_rxQCount;
+static volatile uint32_t  s_rxDroppedCount;   /* valid packets lost: RX queue was full */
 
 static uint8_t  s_txQueue[COMM_TX_QUEUE_LEN][COMM_PKT_LEN];
 static volatile uint8_t s_txHead, s_txTail, s_txCount;
@@ -80,6 +90,30 @@ static void RxReset(void)
     s_rxCount = 0;
 }
 
+/* A frame failed its checksum. The real frame may have started at a later
+ * 0xAA inside the bytes we already collected (a stray 0xAA earlier in the
+ * stream made us start too soon). Look for it, keep those bytes, and carry
+ * on collecting from there instead of throwing the real frame away. */
+static void ResyncAfterBadFrame(void)
+{
+    uint8_t i;
+    for (i = 1; i < COMM_PKT_LEN; i++) {
+        if (s_rxBuf[i] == COMM_SOF) {
+            break;
+        }
+    }
+    if (i < COMM_PKT_LEN) {
+        uint8_t n = (uint8_t)(COMM_PKT_LEN - i);
+        for (uint8_t k = 0; k < n; k++) {
+            s_rxBuf[k] = s_rxBuf[i + k];
+        }
+        s_rxCount = n;
+        s_rxState = RX_COLLECT;
+    } else {
+        RxReset();
+    }
+}
+
 /* Kick off transmission of the frame currently sitting at the tail
  * of the queue. Called with the queue known to be non-empty. */
 static void StartNextTx(void)
@@ -89,7 +123,7 @@ static void StartNextTx(void)
     s_txFrameLen = COMM_PKT_LEN;
     s_txBusy = 1;
     s_txByteHW = s_txFrameOut[s_txFrameIdx];
-    HAL_UART_Transmit_IT(&RELAY_HUART, &s_txByteHW, 1);
+    HAL_UART_Transmit_IT(&RELAY_TX_HUART, &s_txByteHW, 1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -99,7 +133,8 @@ void Comm_Init(void)
 {
     s_rxState = RX_WAIT_SOF;
     s_rxCount = 0;
-    s_rxPacketReady = 0;
+    s_rxQHead = s_rxQTail = s_rxQCount = 0;
+    s_rxDroppedCount = 0;
     s_rxLastByteTick = 0;
 
     s_txHead = s_txTail = s_txCount = 0;
@@ -111,7 +146,7 @@ void Comm_Init(void)
 
     /* Arm the first single-byte receive. From here on, every completed
      * receive re-arms itself in HAL_UART_RxCpltCallback(). */
-    HAL_UART_Receive_IT(&RELAY_HUART, &s_rxByteHW, 1);
+    HAL_UART_Receive_IT(&RELAY_RX_HUART, &s_rxByteHW, 1);
 }
 
 uint8_t Comm_SendHazard(uint8_t src, uint8_t seq, uint8_t sev, uint8_t hops)
@@ -158,14 +193,21 @@ void Comm_OnRxByte(uint8_t byte)
             if (s_rxCount == COMM_PKT_LEN) {
                 uint8_t expected = Checksum(s_rxBuf[1], s_rxBuf[2], s_rxBuf[3], s_rxBuf[4]);
                 if (expected == s_rxBuf[5]) {
-                    s_rxPacketReady = 1;   /* Comm_Poll() will dispatch it */
+                    if (s_rxQCount < COMM_RX_QUEUE_LEN) {
+                        s_rxQ[s_rxQHead][0] = s_rxBuf[1];
+                        s_rxQ[s_rxQHead][1] = s_rxBuf[2];
+                        s_rxQ[s_rxQHead][2] = s_rxBuf[3];
+                        s_rxQ[s_rxQHead][3] = s_rxBuf[4];
+                        s_rxQHead = (uint8_t)((s_rxQHead + 1) % COMM_RX_QUEUE_LEN);
+                        s_rxQCount++;           /* Comm_Poll() will dispatch it */
+                    } else {
+                        s_rxDroppedCount++;     /* main loop too slow: count it */
+                    }
+                    RxReset();
                 } else {
                     s_errCount++;
-                    /* Resynchronise: a bad frame doesn't necessarily mean
-                     * the NEXT 0xAA we saw was real garbage, so just go
-                     * back to hunting for SOF. */
+                    ResyncAfterBadFrame();
                 }
-                RxReset();
             }
             break;
 
@@ -177,18 +219,27 @@ void Comm_OnRxByte(uint8_t byte)
 
 void Comm_Poll(void)
 {
-    /* 1) Dispatch a fully-received, checksum-valid packet to node_app. */
-    if (s_rxPacketReady) {
-        uint8_t src, seq, sev, hops;
+    /* 1) Dispatch every validated packet to node_app, oldest first. The
+     *    callback runs outside the critical section, so a slow node_app
+     *    never blocks the UART interrupt. */
+    for (;;) {
+        uint8_t src = 0, seq = 0, sev = 0, hops = 0, have = 0;
 
         __disable_irq();
-        src  = s_rxBuf[1];
-        seq  = s_rxBuf[2];
-        sev  = s_rxBuf[3];
-        hops = s_rxBuf[4];
-        s_rxPacketReady = 0;
+        if (s_rxQCount > 0) {
+            src  = s_rxQ[s_rxQTail][0];
+            seq  = s_rxQ[s_rxQTail][1];
+            sev  = s_rxQ[s_rxQTail][2];
+            hops = s_rxQ[s_rxQTail][3];
+            s_rxQTail = (uint8_t)((s_rxQTail + 1) % COMM_RX_QUEUE_LEN);
+            s_rxQCount--;
+            have = 1;
+        }
         __enable_irq();
 
+        if (!have) {
+            break;
+        }
         Comm_OnHazardPacket(src, seq, sev, hops);
     }
 
@@ -209,25 +260,26 @@ void Comm_Poll(void)
 uint32_t Comm_GetErrorCount(void)     { return s_errCount; }
 uint32_t Comm_GetTimeoutCount(void)   { return s_timeoutCount; }
 uint32_t Comm_GetDroppedTxCount(void) { return s_droppedTxCount; }
+uint32_t Comm_GetRxDroppedCount(void) { return s_rxDroppedCount; }
 
 /* ------------------------------------------------------------------ */
 /* HAL interrupt callbacks                                            */
 /* ------------------------------------------------------------------ */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == RELAY_HUART.Instance) {
+    if (huart->Instance == RELAY_RX_HUART.Instance) {
         Comm_OnRxByte(s_rxByteHW);
-        HAL_UART_Receive_IT(&RELAY_HUART, &s_rxByteHW, 1);  /* re-arm */
+        HAL_UART_Receive_IT(&RELAY_RX_HUART, &s_rxByteHW, 1);  /* re-arm */
     }
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == RELAY_HUART.Instance) {
+    if (huart->Instance == RELAY_TX_HUART.Instance) {
         s_txFrameIdx++;
         if (s_txFrameIdx < s_txFrameLen) {
             s_txByteHW = s_txFrameOut[s_txFrameIdx];
-            HAL_UART_Transmit_IT(&RELAY_HUART, &s_txByteHW, 1);
+            HAL_UART_Transmit_IT(&RELAY_TX_HUART, &s_txByteHW, 1);
         } else {
             /* Frame finished: pop the queue and start the next one, if any. */
             s_txTail = (uint8_t)((s_txTail + 1) % COMM_TX_QUEUE_LEN);

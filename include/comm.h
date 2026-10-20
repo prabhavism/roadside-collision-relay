@@ -22,6 +22,7 @@
 #define COMM_SOF            0xAAu
 #define COMM_TX_QUEUE_LEN    4u      /* max packets queued for transmit at once   */
 #define COMM_RX_TIMEOUT_MS   5u      /* reset the parser if a frame stalls this long */
+/* (the RX packet queue length, COMM_RX_QUEUE_LEN = 4, is internal to comm.c) */
 
 /* --- lifecycle --- */
 void Comm_Init(void);
@@ -45,6 +46,7 @@ void Comm_OnRxByte(uint8_t byte);
 uint32_t Comm_GetErrorCount(void);      /* bad checksum / framing errors seen   */
 uint32_t Comm_GetTimeoutCount(void);    /* RX frames that stalled and were reset */
 uint32_t Comm_GetDroppedTxCount(void);  /* packets dropped because TX queue was full */
+uint32_t Comm_GetRxDroppedCount(void);   /* valid packets lost because the RX queue was full */
 
 /* --- the callback you (Prabhav) implement in node_app.c ---
  * Called from Comm_Poll() context (NOT from the ISR) once a full, valid

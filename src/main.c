@@ -17,7 +17,8 @@
 #include "alert.h"
 #include "log.h"
 
-UART_HandleTypeDef RELAY_HUART;   /* MX_USARTx_Init() fills this in   */
+UART_HandleTypeDef RELAY_RX_HUART;  /* relay-in  (from previous node) */
+UART_HandleTypeDef RELAY_TX_HUART;  /* relay-out (to next node)       */
 UART_HandleTypeDef LOG_HUART;     /* MX_USARTy_Init() fills this in   */
 
 int main(void)
@@ -25,7 +26,7 @@ int main(void)
     HAL_Init();
     /* SystemClock_Config(); */
     /* MX_GPIO_Init(); */
-    /* MX_USARTx_Init(&RELAY_HUART, ...); */
+    /* MX_USARTx_Init(&RELAY_RX_HUART, ...);  MX_USARTz_Init(&RELAY_TX_HUART, ...); */
     /* MX_USARTy_Init(&LOG_HUART, ...); */
     /* MX_ADC_Init();  MX_TIMx_Init();  -- Rohan's sampling timer/ADC   */
 
